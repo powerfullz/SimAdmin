@@ -189,6 +189,7 @@ pub struct EsimProfileCacheEntry {
     pub msisdn: Option<String>,
     pub smsc: Option<String>,
     pub smdp: Option<String>,
+    pub matching_id: Option<String>,
     pub isdp_aid: Option<String>,
     pub mcc: Option<String>,
     pub mnc: Option<String>,
@@ -525,6 +526,13 @@ impl Database {
             )",
             [],
         )?;
+
+        if !table_has_column(&conn, "esim_profile_cache", "matching_id")? {
+            conn.execute(
+                "ALTER TABLE esim_profile_cache ADD COLUMN matching_id TEXT",
+                [],
+            )?;
+        }
 
         conn.execute(
             "CREATE TABLE IF NOT EXISTS auth_config (
@@ -1576,7 +1584,8 @@ impl Database {
     // ==================== eSIM Profile cache ====================
 
     pub fn upsert_esim_profile_cache(&self, entry: &EsimProfileCacheEntry) -> Result<()> {
-        if entry.iccid.trim().is_empty() {
+        let iccid = crate::utils::normalize_iccid(&entry.iccid);
+        if iccid.is_empty() {
             return Ok(());
         }
 
@@ -1588,6 +1597,7 @@ impl Database {
             entry.msisdn.as_deref(),
             entry.smsc.as_deref(),
             entry.smdp.as_deref(),
+            entry.matching_id.as_deref(),
             entry.isdp_aid.as_deref(),
             entry.mcc.as_deref(),
             entry.mnc.as_deref(),
@@ -1605,9 +1615,9 @@ impl Database {
         conn.execute(
             "INSERT INTO esim_profile_cache (
                 iccid, name, provider, profile_class, imsi, msisdn, smsc, smdp,
-                isdp_aid, mcc, mnc, updated_at
+                matching_id, isdp_aid, mcc, mnc, updated_at
              )
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
              ON CONFLICT(iccid) DO UPDATE SET
                 name = COALESCE(excluded.name, esim_profile_cache.name),
                 provider = COALESCE(excluded.provider, esim_profile_cache.provider),
@@ -1616,12 +1626,13 @@ impl Database {
                 msisdn = COALESCE(excluded.msisdn, esim_profile_cache.msisdn),
                 smsc = COALESCE(excluded.smsc, esim_profile_cache.smsc),
                 smdp = COALESCE(excluded.smdp, esim_profile_cache.smdp),
+                matching_id = COALESCE(excluded.matching_id, esim_profile_cache.matching_id),
                 isdp_aid = COALESCE(excluded.isdp_aid, esim_profile_cache.isdp_aid),
                 mcc = COALESCE(excluded.mcc, esim_profile_cache.mcc),
                 mnc = COALESCE(excluded.mnc, esim_profile_cache.mnc),
                 updated_at = excluded.updated_at",
             params![
-                entry.iccid.trim(),
+                &iccid,
                 non_empty_option(entry.name.as_deref()),
                 non_empty_option(entry.provider.as_deref()),
                 non_empty_option(entry.profile_class.as_deref()),
@@ -1629,6 +1640,7 @@ impl Database {
                 non_empty_option(entry.msisdn.as_deref()),
                 non_empty_option(entry.smsc.as_deref()),
                 non_empty_option(entry.smdp.as_deref()),
+                non_empty_option(entry.matching_id.as_deref()),
                 non_empty_option(entry.isdp_aid.as_deref()),
                 non_empty_option(entry.mcc.as_deref()),
                 non_empty_option(entry.mnc.as_deref()),
@@ -1639,7 +1651,7 @@ impl Database {
     }
 
     pub fn get_esim_profile_cache(&self, iccid: &str) -> Result<Option<EsimProfileCacheEntry>> {
-        let iccid = iccid.trim();
+        let iccid = crate::utils::normalize_iccid(iccid);
         if iccid.is_empty() {
             return Ok(None);
         }
@@ -1647,10 +1659,10 @@ impl Database {
         let conn = self.conn.lock().unwrap();
         conn.query_row(
             "SELECT iccid, name, provider, profile_class, imsi, msisdn, smsc, smdp,
-                    isdp_aid, mcc, mnc, updated_at
+                    matching_id, isdp_aid, mcc, mnc, updated_at
              FROM esim_profile_cache
              WHERE iccid = ?1",
-            params![iccid],
+            params![&iccid],
             |row| {
                 Ok(EsimProfileCacheEntry {
                     iccid: row.get(0)?,
@@ -1661,10 +1673,11 @@ impl Database {
                     msisdn: row.get(5)?,
                     smsc: row.get(6)?,
                     smdp: row.get(7)?,
-                    isdp_aid: row.get(8)?,
-                    mcc: row.get(9)?,
-                    mnc: row.get(10)?,
-                    updated_at: row.get(11)?,
+                    matching_id: row.get(8)?,
+                    isdp_aid: row.get(9)?,
+                    mcc: row.get(10)?,
+                    mnc: row.get(11)?,
+                    updated_at: row.get(12)?,
                 })
             },
         )
@@ -1675,7 +1688,7 @@ impl Database {
         let conn = self.conn.lock().unwrap();
         let mut statement = conn.prepare(
             "SELECT iccid, name, provider, profile_class, imsi, msisdn, smsc, smdp,
-                    isdp_aid, mcc, mnc, updated_at
+                    matching_id, isdp_aid, mcc, mnc, updated_at
              FROM esim_profile_cache
              ORDER BY updated_at DESC, iccid ASC",
         )?;
@@ -1689,10 +1702,11 @@ impl Database {
                 msisdn: row.get(5)?,
                 smsc: row.get(6)?,
                 smdp: row.get(7)?,
-                isdp_aid: row.get(8)?,
-                mcc: row.get(9)?,
-                mnc: row.get(10)?,
-                updated_at: row.get(11)?,
+                matching_id: row.get(8)?,
+                isdp_aid: row.get(9)?,
+                mcc: row.get(10)?,
+                mnc: row.get(11)?,
+                updated_at: row.get(12)?,
             })
         })?;
 
@@ -1700,10 +1714,11 @@ impl Database {
     }
 
     pub fn delete_esim_profile_cache(&self, iccid: &str) -> Result<()> {
+        let iccid = crate::utils::normalize_iccid(iccid);
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "DELETE FROM esim_profile_cache WHERE iccid = ?1",
-            params![iccid.trim()],
+            params![&iccid],
         )?;
         Ok(())
     }

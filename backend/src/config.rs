@@ -1472,12 +1472,15 @@ impl Default for ApnConfig {
 pub struct EsimConfig {
     #[serde(default = "default_lpac_path")]
     pub lpac_path: String,
+    #[serde(default)]
+    pub custom_memory_total_kb: Option<u32>,
 }
 
 impl Default for EsimConfig {
     fn default() -> Self {
         Self {
             lpac_path: default_lpac_path(),
+            custom_memory_total_kb: None,
         }
     }
 }
@@ -1623,6 +1626,14 @@ impl ConfigManager {
 
     pub fn get_esim_config(&self) -> EsimConfig {
         self.config.read().unwrap().esim.clone()
+    }
+
+    pub fn set_esim_config(&self, esim: EsimConfig) -> Result<(), String> {
+        {
+            let mut c = self.config.write().unwrap();
+            c.esim = esim;
+        }
+        self.save()
     }
 
     pub fn get_device_network(&self) -> DeviceNetworkConfig {

@@ -671,6 +671,12 @@ async fn main() -> Result<()> {
                 .options(options_handler),
         )
         .route(
+            "/api/esim/config",
+            get(get_esim_config_handler)
+                .post(set_esim_config_handler)
+                .options(options_handler),
+        )
+        .route(
             "/api/esim/lpac/status",
             get(get_esim_lpac_status_handler).options(options_handler),
         )

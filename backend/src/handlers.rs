@@ -190,6 +190,7 @@ fn profile_cache_entry(profile: &EsimProfile) -> EsimProfileCacheEntry {
         msisdn: optional_profile_cache_value(&profile.msisdn),
         smsc: optional_profile_cache_value(&profile.smsc),
         smdp: optional_profile_cache_value(&profile.smdp),
+        matching_id: optional_profile_cache_value(&profile.matching_id),
         isdp_aid: optional_profile_cache_value(&profile.isdp_aid),
         mcc: optional_profile_cache_value(&profile.mcc),
         mnc: optional_profile_cache_value(&profile.mnc),
@@ -230,6 +231,7 @@ fn hydrate_profile_from_cache(db: &Database, profile: &mut EsimProfile) {
     fill_cached_option(&mut profile.msisdn, cache.msisdn);
     fill_cached_option(&mut profile.smsc, cache.smsc);
     fill_cached_option(&mut profile.smdp, cache.smdp);
+    fill_cached_option(&mut profile.matching_id, cache.matching_id);
     fill_cached_option(&mut profile.isdp_aid, cache.isdp_aid);
     fill_cached_option(&mut profile.mcc, cache.mcc);
     fill_cached_option(&mut profile.mnc, cache.mnc);
@@ -260,6 +262,7 @@ fn profile_from_cache_entry(entry: EsimProfileCacheEntry) -> EsimProfile {
         msisdn: entry.msisdn,
         smsc: entry.smsc,
         smdp: entry.smdp,
+        matching_id: entry.matching_id,
         isdp_aid: entry.isdp_aid,
         mcc: entry.mcc,
         mnc: entry.mnc,
@@ -387,6 +390,33 @@ pub async fn repair_esim_lpac_handler(
                 .await;
             esim_error_response::<EsimLpacRepairResponse>(err)
         }
+    }
+}
+
+
+/// GET /api/esim/config
+pub async fn get_esim_config_handler(State(app): State<AppState>) -> impl IntoResponse {
+    let esim_config = app.config_manager.get_esim_config();
+    (
+        StatusCode::OK,
+        Json(ApiResponse::success_with_message("Success", esim_config)),
+    )
+}
+
+/// POST /api/esim/config
+pub async fn set_esim_config_handler(
+    State(app): State<AppState>,
+    Json(payload): Json<crate::config::EsimConfig>,
+) -> impl IntoResponse {
+    match app.config_manager.set_esim_config(payload) {
+        Ok(_) => (
+            StatusCode::OK,
+            Json(ApiResponse::<()>::success_with_message("eSIM config updated successfully", ())),
+        ),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiResponse::<()>::error(err)),
+        ),
     }
 }
 
@@ -664,6 +694,19 @@ pub async fn download_esim_profile_handler(
         );
     }
 
+    // 在写卡前，先异步读取一次卡上的所有 profile ICCID 集合，用于后续新卡判定
+    let initial_iccids_opt: Option<std::collections::HashSet<String>> = app
+        .esim_supervisor
+        .get_profiles()
+        .await
+        .ok()
+        .map(|resp| {
+            resp.profiles
+                .into_iter()
+                .map(|p| crate::utils::normalize_iccid(&p.iccid))
+                .collect()
+        });
+
     match app.esim_supervisor.download_profile(payload.clone()).await {
         Ok(data) => {
             if esim_command_succeeded(&data) {
@@ -674,19 +717,23 @@ pub async fn download_esim_profile_handler(
                     if profile.smdp.as_deref().unwrap_or("").trim().is_empty() {
                         profile.smdp = Some(smdp.clone());
                     }
+                    if profile.matching_id.as_deref().unwrap_or("").trim().is_empty() {
+                        profile.matching_id = Some(matching_id.clone());
+                    }
 
                     let entry = EsimProfileCacheEntry {
                         iccid: profile.iccid.clone(),
-                        name: Some(profile.name),
-                        provider: Some(profile.provider),
-                        profile_class: Some(profile.profile_class),
-                        imsi: profile.imsi,
-                        msisdn: profile.msisdn,
-                        smsc: profile.smsc,
-                        smdp: profile.smdp,
-                        isdp_aid: profile.isdp_aid,
-                        mcc: profile.mcc,
-                        mnc: profile.mnc,
+                        name: Some(profile.name.clone()),
+                        provider: Some(profile.provider.clone()),
+                        profile_class: Some(profile.profile_class.clone()),
+                        imsi: profile.imsi.clone(),
+                        msisdn: profile.msisdn.clone(),
+                        smsc: profile.smsc.clone(),
+                        smdp: profile.smdp.clone(),
+                        matching_id: profile.matching_id.clone(),
+                        isdp_aid: profile.isdp_aid.clone(),
+                        mcc: profile.mcc.clone(),
+                        mnc: profile.mnc.clone(),
                         updated_at: chrono::Utc::now().to_rfc3339(),
                     };
 
@@ -704,18 +751,150 @@ pub async fn download_esim_profile_handler(
                         )
                         .await;
                 } else {
-                    // Fallback if we couldn't parse the profile details from lpac, just log success
+                    // Fallback if we couldn't parse the profile details from lpac.
+                    // Query the profiles on the card to identify the new one(s) that lack smdp/matching_id in cache.
+                    let mut cached_fallback_iccid = None;
+
+                    // 1. 等待 1.5 秒，让 eUICC 卡片状态恢复稳定
+                    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+
+                    // 2. 尝试读取最新列表，最多重试 4 次，每次间隔 1.5 秒
+                    let mut profiles_resp = None;
+                    for attempt in 1..=4 {
+                        match app.esim_supervisor.get_profiles().await {
+                            Ok(resp) => {
+                                profiles_resp = Some(resp);
+                                break;
+                            }
+                            Err(err) => {
+                                warn!(attempt = attempt, error = ?err, "Failed to get profiles during fallback retry");
+                                if attempt < 4 {
+                                    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+                                }
+                            }
+                        }
+                    }
+
+                    if let Some(resp) = profiles_resp {
+                        if let Some(ref init_iccids) = initial_iccids_opt {
+                            for p in resp.profiles {
+                                let norm_iccid = crate::utils::normalize_iccid(&p.iccid);
+                                let is_new_profile = !init_iccids.contains(&norm_iccid);
+                                
+                                if is_new_profile {
+                                    let needs_cache = match app.database.get_esim_profile_cache(&p.iccid) {
+                                        Ok(Some(cached_entry)) => {
+                                            cached_entry.smdp.as_deref().unwrap_or("").trim().is_empty()
+                                        }
+                                        _ => true,
+                                    };
+                                    if needs_cache {
+                                        let entry = EsimProfileCacheEntry {
+                                            iccid: p.iccid.clone(),
+                                            name: Some(p.name.clone()),
+                                            provider: Some(p.provider.clone()),
+                                            profile_class: Some(p.profile_class.clone()),
+                                            imsi: p.imsi.clone(),
+                                            msisdn: p.msisdn.clone(),
+                                            smsc: p.smsc.clone(),
+                                            smdp: Some(smdp.clone()),
+                                            matching_id: Some(matching_id.clone()),
+                                            isdp_aid: p.isdp_aid.clone(),
+                                            mcc: p.mcc.clone(),
+                                            mnc: p.mnc.clone(),
+                                            updated_at: chrono::Utc::now().to_rfc3339(),
+                                        };
+                                        if let Err(err) = app.database.upsert_esim_profile_cache(&entry) {
+                                            warn!(iccid = %entry.iccid, error = %err, "Failed to cache fallback eSIM profile to database");
+                                        } else {
+                                            cached_fallback_iccid = Some(p.iccid.clone());
+                                        }
+                                    }
+                                }
+                            }
+                        } else {
+                            warn!("Initial ICCIDs list was unavailable before writing; fallback difference detection skipped to prevent profile mismatch");
+                        }
+                    } else {
+                        error!("Failed to fetch profiles list after writing even with retries; fallback profile caching cannot proceed");
+                    }
+
+                    let event_entity = cached_fallback_iccid
+                        .as_ref()
+                        .map(|iccid| mask_identifier(iccid))
+                        .unwrap_or_else(|| "esim".to_string());
+
                     app.system_event_emitter
                         .emit_code(
                             system_event_codes::ESIM_PROFILE_DOWNLOAD_SUCCEEDED,
                             system_event_severity::INFO,
                             system_event_status::SUCCEEDED,
-                            "esim",
-                            "Profile 写入成功",
+                            event_entity,
+                            "Profile 写入成功，已通过列表扫描更新缓存",
                         )
                         .await;
                 }
             } else {
+                let msg = data.msg.clone();
+                let is_refused = msg.contains("MatchingID is refused") || 
+                                 msg.contains("es9p_initiate_authentication") ||
+                                 msg.contains("es10b_load_bound_profile_package") ||
+                                 data.data.as_ref()
+                                     .map(|v| {
+                                         let s = v.to_string();
+                                         s.contains("MatchingID is refused") ||
+                                         s.contains("es9p_initiate_authentication") ||
+                                         s.contains("es10b_load_bound_profile_package")
+                                     })
+                                     .unwrap_or(false);
+                
+                if is_refused {
+                    info!("MatchingID is refused, attempting to bind matching info to the profile if it exists");
+                    let mut cached_fallback_iccid = None;
+                    if let Ok(profiles_resp) = app.esim_supervisor.get_profiles().await {
+                        for p in profiles_resp.profiles {
+                            let needs_cache = match app.database.get_esim_profile_cache(&p.iccid) {
+                                Ok(Some(cached_entry)) => {
+                                    cached_entry.smdp.as_deref().unwrap_or("").trim().is_empty()
+                                }
+                                _ => true,
+                            };
+                            if needs_cache {
+                                let entry = EsimProfileCacheEntry {
+                                    iccid: p.iccid.clone(),
+                                    name: Some(p.name.clone()),
+                                    provider: Some(p.provider.clone()),
+                                    profile_class: Some(p.profile_class.clone()),
+                                    imsi: p.imsi.clone(),
+                                    msisdn: p.msisdn.clone(),
+                                    smsc: p.smsc.clone(),
+                                    smdp: Some(smdp.clone()),
+                                    matching_id: Some(matching_id.clone()),
+                                    isdp_aid: p.isdp_aid.clone(),
+                                    mcc: p.mcc.clone(),
+                                    mnc: p.mnc.clone(),
+                                    updated_at: chrono::Utc::now().to_rfc3339(),
+                                };
+                                if let Ok(_) = app.database.upsert_esim_profile_cache(&entry) {
+                                    cached_fallback_iccid = Some(p.iccid.clone());
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if let Some(ref iccid) = cached_fallback_iccid {
+                        app.system_event_emitter
+                            .emit_code(
+                                system_event_codes::ESIM_PROFILE_DOWNLOAD_SUCCEEDED,
+                                system_event_severity::INFO,
+                                system_event_status::SUCCEEDED,
+                                mask_identifier(iccid),
+                                "Profile 已被使用，成功将 Matching ID 绑定至对应卡片",
+                            )
+                            .await;
+                    }
+                }
+
                 app.system_event_emitter
                     .emit_code(
                         system_event_codes::ESIM_PROFILE_DOWNLOAD_FAILED,

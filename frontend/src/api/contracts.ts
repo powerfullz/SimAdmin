@@ -59,7 +59,13 @@ export interface EsimEuiccInfo {
   manufacturer: string
   memory_total_kb?: number
   memory_available_kb?: number
+  memory_total_customizable?: boolean
   raw: unknown
+}
+
+export interface EsimConfig {
+  lpac_path: string
+  custom_memory_total_kb?: number | null
 }
 
 export interface EsimProfile {
@@ -72,6 +78,7 @@ export interface EsimProfile {
   msisdn?: string
   smsc?: string
   smdp?: string
+  matching_id?: string
   isdp_aid?: string
   mcc?: string
   mnc?: string

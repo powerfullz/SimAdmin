@@ -1159,10 +1159,10 @@ pub async fn current_sim_identity(conn: &Connection) -> Option<SimIdentity> {
     let sim_props = get_all_properties(conn, &sim_path, MM_SIM)
         .await
         .unwrap_or_default();
-    let iccid = sim_props
+    let iccid = crate::utils::normalize_iccid(&sim_props
         .get("SimIdentifier")
         .map(extract_string)
-        .unwrap_or_default();
+        .unwrap_or_default());
     let imsi = sim_props
         .get("Imsi")
         .map(extract_string)
@@ -1817,10 +1817,10 @@ pub async fn get_sim_info_data_with_cache(
 
     let sim_props = get_all_properties(conn, &sim_path, MM_SIM).await?;
     let msg_smsc = messaging_smsc_fallback(conn, &modem_path).await;
-    let iccid = sim_props
+    let iccid = crate::utils::normalize_iccid(&sim_props
         .get("SimIdentifier")
         .map(extract_string)
-        .unwrap_or_default();
+        .unwrap_or_default());
     let imsi = sim_props
         .get("Imsi")
         .map(extract_string)
@@ -5189,6 +5189,27 @@ pub async fn set_call_waiting(conn: &Connection, enabled: bool) -> zbus::Result<
     .await
 }
 
+fn schedule_sent_sms_delete(conn: &Connection, modem_path: &str, sms_path: OwnedObjectPath) {
+    let conn_clone = conn.clone();
+    let modem_path = modem_path.to_string();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        let proxy = Proxy::new(&conn_clone, MM_SERVICE, modem_path.as_str(), MM_MESSAGING).await;
+        match proxy {
+            Ok(proxy) => {
+                if let Err(e) = proxy.call::<_, _, ()>("Delete", &(sms_path.clone(),)).await {
+                    warn!(error = %e, path = ?sms_path, "Failed to delete sent SMS from ModemManager");
+                } else {
+                    info!(path = ?sms_path, "Sent SMS deleted successfully from ModemManager");
+                }
+            }
+            Err(e) => {
+                warn!(error = %e, "Failed to create ModemManager messaging proxy for SMS deletion");
+            }
+        }
+    });
+}
+
 pub async fn send_sms(
     conn: &Connection,
     phone_number: &str,
@@ -5207,6 +5228,7 @@ pub async fn send_sms(
         sms_proxy.call::<_, _, ()>("Send", &()).await?;
 
         info!(path = %sms_path, "SMS sent successfully");
+        schedule_sent_sms_delete(conn, modem_path.as_str(), sms_path.clone());
         Ok(sms_path.to_string())
     })
     .await

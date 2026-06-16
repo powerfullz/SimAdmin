@@ -364,6 +364,20 @@ nm-bridge\t0044A8C0\t00000000\t0001\t0\t0\t425\t00FFFFFF\t0\t0\t0";
         assert!(interfaces.contains("wwan0"));
         assert!(!interfaces.contains("lo"));
     }
+
+    #[test]
+    fn test_normalize_iccid() {
+        // 19位 纯数字 -> 保持前19位不变
+        assert_eq!(normalize_iccid("8986000000000000001"), "8986000000000000001");
+        // 20位 带尾部 F -> 去掉 F 并保留前19位
+        assert_eq!(normalize_iccid("8986000000000000001F"), "8986000000000000001");
+        assert_eq!(normalize_iccid("8986000000000000001f"), "8986000000000000001");
+        // 正常的 20位数字 -> 截断并保留前19位
+        assert_eq!(normalize_iccid("89860000000000000018"), "8986000000000000001");
+        assert_eq!(normalize_iccid("89860000000000000010"), "8986000000000000001");
+        // 空字符串 -> 保持空
+        assert_eq!(normalize_iccid(""), "");
+    }
 }
 
 /// 从 /proc/stat 解析 CPU 时间
@@ -1362,3 +1376,16 @@ pub async fn read_network_interfaces(
 
     Ok(interfaces)
 }
+
+pub fn normalize_iccid(iccid: &str) -> String {
+    let mut cleaned = iccid.trim().to_string();
+    // 移除所有非数字字符（例如尾部可能带有的 F、f 或空白）
+    cleaned = cleaned.chars().filter(|c| c.is_ascii_digit()).collect();
+
+    // 如果长度大于等于 19 位，只保留前 19 位进行比对，不做 Luhn 算法补全
+    if cleaned.len() >= 19 {
+        cleaned.truncate(19);
+    }
+    cleaned
+}
+

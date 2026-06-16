@@ -168,6 +168,31 @@ function formatIccid(iccid: string) {
   return iccid.replace(/(\d{4})(?=\d)/g, '$1 ')
 }
 
+function translateEsimError(rawError: string): string {
+  const err = rawError.toLowerCase();
+
+  if (err.includes("matchingid is refused") || err.includes("matching id was refused")) {
+    return "激活码已被使用或失效 (Matching ID was refused by SM-DP+ server)";
+  }
+  if (err.includes("es9p_initiate_authentication")) {
+    return "无法启动身份认证。请检查设备是否已联网，或者激活码是否有效 (es9p_initiate_authentication)";
+  }
+  if (err.includes("es10b_load_bound_profile_package")) {
+    return "安全域装载失败。这通常是因为该配置文件已存在于当前芯片中，无法重复写入 (es10b_load_bound_profile_package)";
+  }
+  if (err.includes("connect") || err.includes("timeout") || err.includes("resolve") || err.includes("could not resolve")) {
+    return "网络连接超时或无法解析服务器地址，请确保设备已正常联网后再试";
+  }
+  if (err.includes("es10b_")) {
+    return `芯片交互阶段发生错误 (${rawError})，请确认卡片接触良好或芯片空间是否充足`;
+  }
+  if (err.includes("es9p_")) {
+    return `服务器通信阶段发生错误 (${rawError})，请检查网络状态与激活码是否正确`;
+  }
+
+  return rawError;
+}
+
 function profileStateLabel(state: string) {
   const normalized = state.toLowerCase()
   if (normalized === 'active' || normalized === 'enabled' || normalized === '1') return '已启用'
@@ -552,6 +577,37 @@ export default function EsimManagerPage() {
   const [lpacRepairing, setLpacRepairing] = useState(false)
   const [lpacProxyPrefix, setLpacProxyPrefix] = useState(LPAC_PROXY_PREFIX_OPTIONS[0].value)
 
+  const [totalMemoryDialogOpen, setTotalMemoryDialogOpen] = useState(false)
+  const [totalMemoryInput, setTotalMemoryInput] = useState('')
+  const [savingTotalMemory, setSavingTotalMemory] = useState(false)
+
+  const handleOpenTotalMemoryDialog = () => {
+    setTotalMemoryInput(euicc?.memory_total_kb ? String(Math.round(euicc.memory_total_kb)) : '')
+    setTotalMemoryDialogOpen(true)
+  }
+
+  const handleSaveTotalMemory = async () => {
+    const val = parseInt(totalMemoryInput, 10)
+    if (isNaN(val) || val <= 0) {
+      setError('请输入有效的正整数容量（单位：KB）')
+      return
+    }
+    setSavingTotalMemory(true)
+    try {
+      const cfgRes = await api.getEsimConfig()
+      const currentCfg = cfgRes.data || { lpac_path: '' }
+      currentCfg.custom_memory_total_kb = val
+      await api.setEsimConfig(currentCfg)
+      setSuccess('保存自定义芯片总容量成功')
+      setTotalMemoryDialogOpen(false)
+      void loadData()
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setSavingTotalMemory(false)
+    }
+  }
+
   const [showAddWorkspace, setShowAddWorkspace] = useState(false)
   const [smartInput, setSmartInput] = useState('')
   const [addForm, setAddForm] = useState({
@@ -681,24 +737,26 @@ export default function EsimManagerPage() {
         ...prev,
         { time: '[00:25]', text: 'SHA256 密匙签名芯片端校验一致通过。', type: 'success' },
         { time: '[00:28]', text: 'Profile 写入完毕！', type: 'success' },
-        { time: '[00:30]', text: '操作成功，正在刷新 Profile 列表并水合本地缓存。', type: 'success' },
+        { time: '[00:30]', text: '操作成功，正在刷新 Profile 列表并更新本地缓存。', type: 'success' },
+        { time: '[SUCCESS]', text: '新配置已在 eUICC 芯片中成功写入，本地数据库缓存已更新。', type: 'success' },
       ])
 
       setTimeout(() => {
         setWriteState('success')
-        setSuccess('Profile 写入成功，本地 SQLite 缓存已水合更新')
+        setSuccess('Profile 写入成功，本地数据库缓存已更新')
         void loadData(true)
       }, 1000)
 
     } catch (err) {
       window.clearInterval(timer)
       const msg = err instanceof Error ? err.message : String(err)
+      const friendlyMsg = translateEsimError(msg)
       setWriteState('failed')
       setWriteLogLines((prev) => [
         ...prev,
-        { time: '[ERR]', text: `写入失败: ${msg}`, type: 'error' },
+        { time: '[ERR]', text: `写入失败: ${friendlyMsg}`, type: 'error' },
       ])
-      setError(`写卡失败: ${msg}`)
+      setError(`写卡失败: ${friendlyMsg}`)
     }
   }
 
@@ -709,6 +767,7 @@ export default function EsimManagerPage() {
   const defaultSmdp = useMemo(() => extractDefaultSmdp(euicc?.raw), [euicc])
   const selectedProvider = selectedProfile ? profileProviderLabel(selectedProfile) : ''
   const selectedSmdp = selectedProfile?.smdp || defaultSmdp
+  const selectedMatchingId = selectedProfile?.matching_id
   const selectedCountryCode = profileCountryCode(selectedProfile)
 
   const loadData = async (silent = false) => {
@@ -816,7 +875,7 @@ export default function EsimManagerPage() {
   }, []) // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
-    if (writeState === 'writing' || writeState === 'failed') {
+    if (writeState !== 'idle') {
       logEndRef.current?.scrollIntoView({ behavior: 'smooth' })
     }
   }, [writeLogLines, writeState])
@@ -1092,8 +1151,15 @@ export default function EsimManagerPage() {
                 {hasMemoryInfo && (
                   <Box sx={{ width: { xs: '100%', md: 300 }, ml: { md: 'auto' } }}>
                     <Box display="flex" alignItems="center" justifyContent="space-between" gap={1} mb={0.75}>
-                      <Typography variant="caption" color="text.secondary">
+                      <Typography variant="caption" color="text.secondary" display="inline-flex" alignItems="center" gap={0.5}>
                         eUICC 容量
+                        {euicc?.memory_total_customizable && (
+                          <Tooltip title="自定义总容量">
+                            <IconButton size="small" onClick={handleOpenTotalMemoryDialog} sx={{ p: 0.25 }}>
+                              <Edit sx={{ fontSize: 13 }} />
+                            </IconButton>
+                          </Tooltip>
+                        )}
                       </Typography>
                       <Typography variant="caption" color="text.primary" fontWeight={400}>
                         {memoryPercentLabel}
@@ -1248,309 +1314,267 @@ export default function EsimManagerPage() {
                 {showAddWorkspace ? (
                   <>
                     <Box sx={{ px: 3, height: 66, minHeight: 66, display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-                    <Box display="flex" alignItems="center" gap={1}>
-                      <CloudDownload color="primary" />
-                      <Typography sx={{ fontSize: '16px', fontWeight: 700 }}>添加 Profile</Typography>
-                    </Box>
-                    <Box display="flex" gap={1}>
-                      <Button
-                        size="small"
-                        variant="outlined"
-                        onClick={() => {
-                          setShowAddWorkspace(false)
-                          resetAddWorkspace()
-                        }}
-                        disabled={writeState === 'writing'}
-                        sx={{ 
-                          borderColor: 'divider', 
-                          color: 'text.secondary',
-                          '&:hover': {
-                            borderColor: 'text.secondary',
-                            color: 'text.primary',
-                            bgcolor: 'action.hover',
-                          }
-                        }}
-                      >
-                        取消
-                      </Button>
-                      <Button
-                        size="small"
-                        variant="contained"
-                        color="primary"
-                        onClick={() => void startWriteCard()}
-                        disabled={writeState === 'writing' || writeState === 'success' || !addForm.smdp || !addForm.matchingId}
-                      >
-                        开始写卡
-                      </Button>
-                    </Box>
-                  </Box>
-                    <Divider />
-                    <Box sx={{ p: 3, flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
-                      {writeState === 'success' ? (
-                        <Box
+                      <Box display="flex" alignItems="center" gap={1}>
+                        <CloudDownload color="primary" />
+                        <Typography sx={{ fontSize: '16px', fontWeight: 700 }}>添加 Profile</Typography>
+                      </Box>
+                      <Box display="flex" gap={1}>
+                        <Button
+                          size="small"
+                          variant="outlined"
+                          onClick={() => {
+                            setShowAddWorkspace(false)
+                            resetAddWorkspace()
+                          }}
+                          disabled={writeState === 'writing'}
                           sx={{
-                            display: 'flex',
-                            flexDirection: 'column',
-                            alignItems: 'center',
-                            justifyContent: 'center',
-                            minHeight: 300,
-                            textAlign: 'center',
-                            p: 3,
+                            borderColor: 'divider',
+                            color: 'text.secondary',
+                            '&:hover': {
+                              borderColor: 'text.secondary',
+                              color: 'text.primary',
+                              bgcolor: 'action.hover',
+                            }
                           }}
                         >
-                          <Avatar
-                            sx={{
-                              width: 56,
-                              height: 56,
-                              bgcolor: 'success.main',
-                              color: 'success.contrastText',
-                              mb: 2,
-                              boxShadow: '0 0 12px rgba(16, 185, 129, 0.25)',
-                            }}
-                          >
-                            <CheckCircle sx={{ fontSize: 32 }} />
-                          </Avatar>
-                          <Typography variant="h6" fontWeight={700} mb={1}>
-                            Profile 写入成功
-                          </Typography>
-                          <Typography variant="body2" color="text.secondary" mb={3} sx={{ maxWidth: 400 }}>
-                            新配置已在 eUICC 芯片中成功写入，本地 SQLite 缓存已水合更新。您可以在左侧 Profiles 列表中找到它并随时启用。
-                          </Typography>
-                          <Button
-                            variant="outlined"
-                            onClick={() => {
-                              setShowAddWorkspace(false)
-                              resetAddWorkspace()
-                            }}
-                          >
-                            返回详情面板
-                          </Button>
-                        </Box>
-                      ) : (
-                        <>
-                          <Box sx={{ flexShrink: 0, mb: 2 }}>
-                            <Grid container spacing={2} mb={3}>
-                              <Grid size={{ xs: 12, md: 6 }}>
-                                <Box display="flex" flexDirection="column" gap={1}>
-                                  <Typography sx={{ fontSize: '14px', fontWeight: 600, color: 'rgb(15, 23, 42)', display: 'block', mb: 1 }}>
-                                    智能识别框
-                                  </Typography>
-                                  <Box sx={{ position: 'relative' }}>
-                                    <TextField
-                                      fullWidth
-                                      multiline
-                                      rows={3}
-                                      placeholder="在此粘贴 LPA 激活码 (如 LPA:1$smdp.io$matching-id)"
-                                      value={smartInput}
-                                      onChange={(e) => {
-                                        setSmartInput(e.target.value)
-                                        parseLpaCode(e.target.value)
-                                      }}
-                                      disabled={writeState === 'writing'}
-                                      sx={{
-                                        '& .MuiOutlinedInput-root': {
-                                          fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace',
-                                          fontSize: '14px',
-                                          fontWeight: 400,
-                                          height: 98,
-                                          alignItems: 'flex-start',
-                                        }
-                                      }}
-                                    />
-                                    {smartParsed && (
-                                      <Chip
-                                        label="解析成功"
-                                        size="small"
-                                        color="primary"
-                                        sx={{
-                                          position: 'absolute',
-                                          bottom: 8,
-                                          right: 8,
-                                          height: 20,
-                                          fontSize: '0.6875rem',
-                                          pointerEvents: 'none',
-                                        }}
-                                      />
-                                    )}
-                                  </Box>
-                                </Box>
-                              </Grid>
-                              <Grid size={{ xs: 12, md: 6 }}>
-                                <Box display="flex" flexDirection="column" gap={1}>
-                                  <Typography sx={{ fontSize: '14px', fontWeight: 600, color: 'rgb(15, 23, 42)', display: 'block', mb: 1 }}>
-                                    二维码解析区
-                                  </Typography>
-                                  <Box
-                                    onClick={() => fileInputRef.current?.click()}
-                                    onDragOver={(e) => e.preventDefault()}
-                                    onDrop={(e) => {
-                                      e.preventDefault()
-                                      if (e.dataTransfer.files && e.dataTransfer.files[0]) {
-                                        handleQrUpload(e.dataTransfer.files[0])
+                          {writeState === 'success' || writeState === 'failed' ? '返回' : '取消'}
+                        </Button>
+                        <Button
+                          size="small"
+                          variant="contained"
+                          color="primary"
+                          onClick={() => void startWriteCard()}
+                          disabled={writeState === 'writing' || writeState === 'success' || !addForm.smdp || !addForm.matchingId}
+                        >
+                          开始写卡
+                        </Button>
+                      </Box>
+                    </Box>
+                    <Divider />
+                    <Box sx={{ p: 3, flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
+                      <>
+                        <Box sx={{ flexShrink: 0, mb: 2 }}>
+                          <Grid container spacing={2} mb={3}>
+                            <Grid size={{ xs: 12, md: 6 }}>
+                              <Box display="flex" flexDirection="column" gap={1}>
+                                <Typography sx={{ fontSize: '14px', fontWeight: 600, color: 'rgb(15, 23, 42)', display: 'block', mb: 1 }}>
+                                  智能识别框
+                                </Typography>
+                                <Box sx={{ position: 'relative' }}>
+                                  <TextField
+                                    fullWidth
+                                    multiline
+                                    rows={3}
+                                    placeholder="在此粘贴 LPA 激活码 (如 LPA:1$smdp.io$matching-id)"
+                                    value={smartInput}
+                                    onChange={(e) => {
+                                      setSmartInput(e.target.value)
+                                      parseLpaCode(e.target.value)
+                                    }}
+                                    disabled={writeState === 'writing'}
+                                    sx={{
+                                      '& .MuiOutlinedInput-root': {
+                                        fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace',
+                                        fontSize: '14px',
+                                        fontWeight: 400,
+                                        height: 98,
+                                        alignItems: 'flex-start',
                                       }
                                     }}
-                                    sx={{
-                                      height: 98,
-                                      boxSizing: 'border-box',
-                                      border: '1px dashed',
-                                      borderColor: (theme) => alpha(theme.palette.primary.main, 0.4),
-                                      borderRadius: 1,
-                                      bgcolor: (theme) => alpha(theme.palette.primary.main, 0.04),
-                                      color: 'primary.main',
-                                      display: 'flex',
-                                      flexDirection: 'column',
-                                      alignItems: 'center',
-                                      justifyContent: 'center',
-                                      cursor: 'pointer',
-                                      gap: 0.5,
-                                      transition: 'all 0.2s',
-                                      '&:hover': {
-                                        border: '2px dashed',
-                                        borderColor: 'primary.main',
-                                      },
-                                    }}
-                                  >
-                                    <input
-                                      type="file"
-                                      accept="image/*"
-                                      ref={fileInputRef}
-                                      onChange={(e) => {
-                                        if (e.target.files && e.target.files[0]) {
-                                          handleQrUpload(e.target.files[0])
-                                        }
+                                  />
+                                  {smartParsed && (
+                                    <Chip
+                                      label="解析成功"
+                                      size="small"
+                                      color="primary"
+                                      sx={{
+                                        position: 'absolute',
+                                        bottom: 8,
+                                        right: 8,
+                                        height: 20,
+                                        fontSize: '0.6875rem',
+                                        pointerEvents: 'none',
                                       }}
-                                      style={{ display: 'none' }}
                                     />
-                                    <QrCodeScanner color="primary" />
-                                    <Typography variant="caption" sx={{ color: 'primary.main', fontWeight: 500 }}>
-                                      点击或拖入二维码图片解码
-                                    </Typography>
-                                  </Box>
+                                  )}
                                 </Box>
+                              </Box>
+                            </Grid>
+                            <Grid size={{ xs: 12, md: 6 }}>
+                              <Box display="flex" flexDirection="column" gap={1}>
+                                <Typography sx={{ fontSize: '14px', fontWeight: 600, color: 'rgb(15, 23, 42)', display: 'block', mb: 1 }}>
+                                  二维码解析区
+                                </Typography>
+                                <Box
+                                  onClick={() => fileInputRef.current?.click()}
+                                  onDragOver={(e) => e.preventDefault()}
+                                  onDrop={(e) => {
+                                    e.preventDefault()
+                                    if (e.dataTransfer.files && e.dataTransfer.files[0]) {
+                                      handleQrUpload(e.dataTransfer.files[0])
+                                    }
+                                  }}
+                                  sx={{
+                                    height: 98,
+                                    boxSizing: 'border-box',
+                                    border: '1px dashed',
+                                    borderColor: (theme) => alpha(theme.palette.primary.main, 0.4),
+                                    borderRadius: 1,
+                                    bgcolor: (theme) => alpha(theme.palette.primary.main, 0.04),
+                                    color: 'primary.main',
+                                    display: 'flex',
+                                    flexDirection: 'column',
+                                    alignItems: 'center',
+                                    justifyContent: 'center',
+                                    cursor: 'pointer',
+                                    gap: 0.5,
+                                    transition: 'all 0.2s',
+                                    '&:hover': {
+                                      border: '2px dashed',
+                                      borderColor: 'primary.main',
+                                    },
+                                  }}
+                                >
+                                  <input
+                                    type="file"
+                                    accept="image/*"
+                                    ref={fileInputRef}
+                                    onChange={(e) => {
+                                      if (e.target.files && e.target.files[0]) {
+                                        handleQrUpload(e.target.files[0])
+                                      }
+                                    }}
+                                    style={{ display: 'none' }}
+                                  />
+                                  <QrCodeScanner color="primary" />
+                                  <Typography variant="caption" sx={{ color: 'primary.main', fontWeight: 500 }}>
+                                    点击或拖入二维码图片解码
+                                  </Typography>
+                                </Box>
+                              </Box>
+                            </Grid>
+                          </Grid>
+
+                          {/* Bottom 2x2 grid form */}
+                          <Box
+                            sx={{
+                              py: 1,
+                              transition: 'all 0.2s',
+                              mb: writeState === 'writing' || writeState === 'failed' ? 3 : 0,
+                            }}
+                          >
+                            <Typography sx={{ fontSize: '14px', fontWeight: 600, color: 'rgb(15, 23, 42)', display: 'block', mb: 2 }}>
+                              预览与校验
+                            </Typography>
+                            <Grid container columnSpacing={2} rowSpacing={4}>
+                              <Grid size={{ xs: 12, md: 6 }}>
+                                <TextField
+                                  fullWidth
+                                  label="SM-DP+ 服务器地址 *"
+                                  value={addForm.smdp}
+                                  onChange={(e) => setAddForm((prev) => ({ ...prev, smdp: e.target.value }))}
+                                  disabled={writeState === 'writing'}
+                                  slotProps={{
+                                    input: { sx: { fontSize: '14px', fontWeight: 400 } },
+                                    inputLabel: { sx: { fontSize: '14px', fontWeight: 400 } }
+                                  }}
+                                />
+                              </Grid>
+                              <Grid size={{ xs: 12, md: 6 }}>
+                                <TextField
+                                  fullWidth
+                                  label="标识码 (Matching ID)*"
+                                  value={addForm.matchingId}
+                                  onChange={(e) => setAddForm((prev) => ({ ...prev, matchingId: e.target.value }))}
+                                  disabled={writeState === 'writing'}
+                                  slotProps={{
+                                    input: { sx: { fontSize: '14px', fontWeight: 400 } },
+                                    inputLabel: { sx: { fontSize: '14px', fontWeight: 400 } }
+                                  }}
+                                />
+                              </Grid>
+                              <Grid size={{ xs: 12, md: 6 }}>
+                                <TextField
+                                  fullWidth
+                                  label="确认码 (选填)"
+                                  value={addForm.confirmationCode}
+                                  onChange={(e) => setAddForm((prev) => ({ ...prev, confirmationCode: e.target.value }))}
+                                  disabled={writeState === 'writing'}
+                                  slotProps={{
+                                    input: { sx: { fontSize: '14px', fontWeight: 400 } },
+                                    inputLabel: { sx: { fontSize: '14px', fontWeight: 400 } }
+                                  }}
+                                />
+                              </Grid>
+                              <Grid size={{ xs: 12, md: 6 }}>
+                                <TextField
+                                  fullWidth
+                                  label="绑定 IMEI (选填)"
+                                  value={addForm.imei}
+                                  onChange={(e) => setAddForm((prev) => ({ ...prev, imei: e.target.value }))}
+                                  disabled={writeState === 'writing'}
+                                  slotProps={{
+                                    input: {
+                                      sx: {
+                                        fontSize: '14px',
+                                        fontWeight: 400,
+                                        fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace',
+                                      }
+                                    },
+                                    inputLabel: { sx: { fontSize: '14px', fontWeight: 400 } }
+                                  }}
+                                />
                               </Grid>
                             </Grid>
+                          </Box>
+                        </Box>
 
-                            {/* Bottom 2x2 grid form */}
-                            <Box
-                              sx={{
-                                py: 1,
-                                transition: 'all 0.2s',
-                                mb: writeState === 'writing' || writeState === 'failed' ? 3 : 0,
-                              }}
-                            >
-                              <Typography sx={{ fontSize: '14px', fontWeight: 600, color: 'rgb(15, 23, 42)', display: 'block', mb: 2 }}>
-                                预览与校验
+                        {/* Terminal simulation for writing process */}
+                        {writeState !== 'idle' && (
+                          <Box
+                            sx={{
+                              mt: 'auto',
+                              flex: 1,
+                              minHeight: 180,
+                              display: 'flex',
+                              flexDirection: 'column',
+                              border: '1px solid',
+                              borderColor: 'divider',
+                              borderRadius: 1,
+                              bgcolor: 'action.hover',
+                              color: 'text.primary',
+                              fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace',
+                              overflow: 'hidden',
+                            }}
+                          >
+                            <Box sx={{ bgcolor: 'action.selected', px: 2, py: 1, borderBottom: '1px solid', borderColor: 'divider', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                              <Typography variant="caption" sx={{ color: 'text.secondary', fontFamily: 'inherit', fontWeight: 500 }}>
+                                SimAdmin @ Add Profile
                               </Typography>
-                              <Grid container columnSpacing={2} rowSpacing={4}>
-                                <Grid size={{ xs: 12, md: 6 }}>
-                                  <TextField
-                                    fullWidth
-                                    label="SM-DP+ 服务器地址 *"
-                                    value={addForm.smdp}
-                                    onChange={(e) => setAddForm((prev) => ({ ...prev, smdp: e.target.value }))}
-                                    disabled={writeState === 'writing'}
-                                    slotProps={{
-                                      input: { sx: { fontSize: '14px', fontWeight: 400 } },
-                                      inputLabel: { sx: { fontSize: '14px', fontWeight: 400 } }
-                                    }}
-                                  />
-                                </Grid>
-                                <Grid size={{ xs: 12, md: 6 }}>
-                                  <TextField
-                                    fullWidth
-                                    label="标识码 (Matching ID)*"
-                                    value={addForm.matchingId}
-                                    onChange={(e) => setAddForm((prev) => ({ ...prev, matchingId: e.target.value }))}
-                                    disabled={writeState === 'writing'}
-                                    slotProps={{
-                                      input: { sx: { fontSize: '14px', fontWeight: 400 } },
-                                      inputLabel: { sx: { fontSize: '14px', fontWeight: 400 } }
-                                    }}
-                                  />
-                                </Grid>
-                                <Grid size={{ xs: 12, md: 6 }}>
-                                  <TextField
-                                    fullWidth
-                                    label="确认码 (选填)"
-                                    value={addForm.confirmationCode}
-                                    onChange={(e) => setAddForm((prev) => ({ ...prev, confirmationCode: e.target.value }))}
-                                    disabled={writeState === 'writing'}
-                                    slotProps={{
-                                      input: { sx: { fontSize: '14px', fontWeight: 400 } },
-                                      inputLabel: { sx: { fontSize: '14px', fontWeight: 400 } }
-                                    }}
-                                  />
-                                </Grid>
-                                <Grid size={{ xs: 12, md: 6 }}>
-                                  <TextField
-                                    fullWidth
-                                    label="绑定 IMEI (选填)"
-                                    value={addForm.imei}
-                                    onChange={(e) => setAddForm((prev) => ({ ...prev, imei: e.target.value }))}
-                                    disabled={writeState === 'writing'}
-                                    slotProps={{
-                                      input: {
-                                        sx: {
-                                          fontSize: '14px',
-                                          fontWeight: 400,
-                                          fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace',
-                                        }
-                                      },
-                                      inputLabel: { sx: { fontSize: '14px', fontWeight: 400 } }
-                                    }}
-                                  />
-                                </Grid>
-                              </Grid>
+                              <Typography variant="caption" sx={{ color: 'text.secondary', fontFamily: 'inherit', fontWeight: 500 }}>
+                                {writeProgress}%
+                              </Typography>
+                            </Box>
+                            <Box sx={{ p: 2, flex: 1, display: 'flex', flexDirection: 'column', minHeight: 0 }}>
+                              <Box sx={{ mb: 2 }}>
+                                <LinearProgress variant="determinate" value={writeProgress} color="primary" sx={{ height: 4, borderRadius: 1, bgcolor: 'divider' }} />
+                              </Box>
+                              <Box sx={{ fontSize: '0.75rem', lineHeight: 1.6, flex: 1, overflowY: 'auto' }}>
+                                {writeLogLines.map((log, index) => (
+                                  <Box key={index} sx={{ display: 'flex', gap: 1, mb: 0.5 }}>
+                                    <Box component="span" sx={{ color: 'text.secondary' }}>{log.time}</Box>
+                                    <Box component="span" sx={{ color: 'primary.main' }}>&gt;</Box>
+                                    <Box component="span" sx={{ color: log.type === 'error' ? 'error.main' : log.type === 'success' ? 'success.dark' : 'inherit', fontWeight: log.type === 'success' || log.type === 'error' ? 500 : 400 }}>
+                                      {log.text}
+                                    </Box>
+                                  </Box>
+                                ))}
+                                <div ref={logEndRef} />
+                              </Box>
                             </Box>
                           </Box>
-
-                          {/* Terminal simulation for writing process */}
-                          {(writeState === 'writing' || writeState === 'failed') && (
-                            <Box
-                              sx={{
-                                mt: 'auto',
-                                flex: 1,
-                                minHeight: 180,
-                                display: 'flex',
-                                flexDirection: 'column',
-                                border: '1px solid',
-                                borderColor: 'divider',
-                                borderRadius: 1,
-                                bgcolor: 'action.hover',
-                                color: 'text.primary',
-                                fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace',
-                                overflow: 'hidden',
-                              }}
-                            >
-                              <Box sx={{ bgcolor: 'action.selected', px: 2, py: 1, borderBottom: '1px solid', borderColor: 'divider', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-                                <Typography variant="caption" sx={{ color: 'text.secondary', fontFamily: 'inherit', fontWeight: 500 }}>
-                                  SimAdmin @ Add Profile
-                                </Typography>
-                                <Typography variant="caption" sx={{ color: 'text.secondary', fontFamily: 'inherit', fontWeight: 500 }}>
-                                  {writeProgress}%
-                                </Typography>
-                              </Box>
-                              <Box sx={{ p: 2, flex: 1, display: 'flex', flexDirection: 'column', minHeight: 0 }}>
-                                <Box sx={{ mb: 2 }}>
-                                  <LinearProgress variant="determinate" value={writeProgress} color="primary" sx={{ height: 4, borderRadius: 1, bgcolor: 'divider' }} />
-                                </Box>
-                                <Box sx={{ fontSize: '0.75rem', lineHeight: 1.6, flex: 1, overflowY: 'auto' }}>
-                                  {writeLogLines.map((log, index) => (
-                                    <Box key={index} sx={{ display: 'flex', gap: 1, mb: 0.5 }}>
-                                      <Box component="span" sx={{ color: 'text.secondary' }}>{log.time}</Box>
-                                      <Box component="span" sx={{ color: 'primary.main' }}>&gt;</Box>
-                                      <Box component="span" sx={{ color: log.type === 'error' ? 'error.main' : log.type === 'success' ? 'success.dark' : 'inherit', fontWeight: log.type === 'success' || log.type === 'error' ? 500 : 400 }}>
-                                        {log.text}
-                                      </Box>
-                                    </Box>
-                                  ))}
-                                  <div ref={logEndRef} />
-                                </Box>
-                              </Box>
-                            </Box>
-                          )}
-                        </>
-                      )}
+                        )}
+                      </>
                     </Box>
                   </>
                 ) : selectedProfile ? (
@@ -1640,13 +1664,20 @@ export default function EsimManagerPage() {
                           <InfoCell label="SM-DP+ 服务器" value={selectedSmdp} mono />
                         </Grid>
                         <Grid size={{ xs: 12, md: 6 }}>
+                          <InfoCell label="标识码 (Matching ID)" value={selectedMatchingId} mono />
+                        </Grid>
+                        <Grid size={{ xs: 12, md: 6 }}>
                           <InfoCell label="ISDP-AID" value={selectedProfile.isdp_aid} mono />
                         </Grid>
                         <Grid size={{ xs: 12, md: 6 }}>
-                          <InfoCell label="允许禁用" value={selectedProfile.disable_allowed === undefined ? '未知' : selectedProfile.disable_allowed ? '是' : '否'} />
-                        </Grid>
-                        <Grid size={{ xs: 12, md: 6 }}>
-                          <InfoCell label="允许删除" value={selectedProfile.delete_allowed === undefined ? '未知' : selectedProfile.delete_allowed ? '是' : '否'} />
+                          <Box display="flex" gap={2} sx={{ height: '100%' }}>
+                            <Box flex={1}>
+                              <InfoCell label="允许删除" value={selectedProfile.delete_allowed === undefined ? '未知' : selectedProfile.delete_allowed ? '是' : '否'} />
+                            </Box>
+                            <Box flex={1}>
+                              <InfoCell label="允许禁用" value={selectedProfile.disable_allowed === undefined ? '未知' : selectedProfile.disable_allowed ? '是' : '否'} />
+                            </Box>
+                          </Box>
                         </Grid>
                       </Grid>
                     </Box>
@@ -1722,6 +1753,37 @@ export default function EsimManagerPage() {
             onClick={() => void submitRename()}
             disabled={actionLoading || !renameValue.trim()}
             startIcon={actionLoading ? <CircularProgress size={16} /> : undefined}
+          >
+            保存
+          </Button>
+        </DialogActions>
+      </Dialog>
+
+      <Dialog open={totalMemoryDialogOpen} onClose={() => !savingTotalMemory && setTotalMemoryDialogOpen(false)} fullWidth maxWidth="xs">
+        <DialogTitle>自定义 eUICC 芯片总容量</DialogTitle>
+        <DialogContent>
+          <DialogContentText sx={{ mb: 2 }}>
+            如果您的 eUICC 芯片无法识别总容量（内存显示未知），您可以手动指定该芯片的总空间大小，以便正确计算已用空间比例。
+          </DialogContentText>
+          <TextField
+            fullWidth
+            autoFocus
+            margin="dense"
+            label="芯片总容量 (KB)"
+            placeholder="例如: 256, 512, 1024"
+            type="number"
+            value={totalMemoryInput}
+            onChange={(event) => setTotalMemoryInput(event.target.value)}
+            disabled={savingTotalMemory}
+          />
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setTotalMemoryDialogOpen(false)} disabled={savingTotalMemory}>取消</Button>
+          <Button
+            variant="contained"
+            onClick={() => void handleSaveTotalMemory()}
+            disabled={savingTotalMemory || !totalMemoryInput.trim()}
+            startIcon={savingTotalMemory ? <CircularProgress size={16} /> : undefined}
           >
             保存
           </Button>

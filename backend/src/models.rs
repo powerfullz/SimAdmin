@@ -89,6 +89,8 @@ pub struct EsimEuiccInfo {
     pub memory_total_kb: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub memory_available_kb: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_total_customizable: Option<bool>,
     #[serde(default)]
     pub raw: Value,
 }
@@ -109,6 +111,8 @@ pub struct EsimProfile {
     pub smsc: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub smdp: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub matching_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub isdp_aid: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

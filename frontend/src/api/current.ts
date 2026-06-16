@@ -30,6 +30,7 @@ import type {
   DeviceInfo,
   EsimCommandResponse,
   EsimDownloadRequest,
+  EsimConfig,
   EsimEuiccInfo,
   EsimLpacRepairRequest,
   EsimLpacRepairResponse,
@@ -237,6 +238,17 @@ class SimAdminCurrentAPI {
       method: 'POST',
       body: JSON.stringify(body),
       timeoutMs: 10000,
+    })
+  }
+
+  async getEsimConfig() {
+    return request<ApiResponse<EsimConfig>>('/esim/config')
+  }
+
+  async setEsimConfig(config: EsimConfig) {
+    return request<ApiResponse<void>>('/esim/config', {
+      method: 'POST',
+      body: JSON.stringify(config),
     })
   }
 

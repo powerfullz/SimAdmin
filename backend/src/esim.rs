@@ -224,7 +224,17 @@ impl EsimSupervisor {
         if !command_succeeded(&response) {
             return Err(EsimApiError::Command(response.msg));
         }
-        Ok(normalize_euicc_info(response))
+        let mut info = normalize_euicc_info(response);
+        if info.memory_total_kb.is_none() {
+            info.memory_total_customizable = Some(true);
+            let esim_config = self.config_manager.get_esim_config();
+            if let Some(total_kb) = esim_config.custom_memory_total_kb {
+                info.memory_total_kb = Some(total_kb as f64);
+            }
+        } else {
+            info.memory_total_customizable = Some(false);
+        }
+        Ok(info)
     }
 
     pub async fn get_profiles(&self) -> Result<EsimProfilesResponse, EsimApiError> {
@@ -1126,6 +1136,7 @@ fn normalize_euicc_info(response: EsimCommandResponse) -> EsimEuiccInfo {
                 )
             })
         }),
+        memory_total_customizable: None,
         raw: data,
     }
 }
@@ -1182,7 +1193,10 @@ pub fn normalize_profile(value: &Value) -> EsimProfile {
     }
 
     EsimProfile {
-        iccid: string_from(value, &["iccid", "ICCID", "id"]).unwrap_or_default(),
+        iccid: {
+            let raw_iccid = string_from(value, &["iccid", "ICCID", "id"]).unwrap_or_default();
+            raw_iccid.chars().filter(|c| c.is_ascii_digit()).collect()
+        },
         name: string_from(
             value,
             &[
@@ -1254,6 +1268,7 @@ pub fn normalize_profile(value: &Value) -> EsimProfile {
                 "defaultDpAddress",
             ],
         ),
+        matching_id: None,
         isdp_aid: string_from(value, &["isdpAid", "isdp_aid", "aid"]),
         mcc,
         mnc,
